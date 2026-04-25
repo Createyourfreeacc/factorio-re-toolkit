@@ -1,0 +1,20 @@
+# Symbols (mangled or demangled) to expose in factorio_symbols.cpp.
+# One per line. Lines starting with # and blank lines ignored.
+# Patterns matched as substrings against the demangled signature.
+# Add the names of functions you want to hook here. Re-run cmake --build to regenerate.
+
+# Per-tick hot path
+Map::updateEntities()
+Map::postUpdate()
+Game::postUpdate()
+Game::prepareRender()
+
+# Sample entity update
+Entity::update()
+CraftingMachine::update()
+MiningDrill::update()
+Inserter::update()
+
+# Lua bridge entry points (good observability)
+LuaBootstrap::raise_event
+LuaGameScript::create_surface

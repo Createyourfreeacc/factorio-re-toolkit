@@ -1,0 +1,28 @@
+# Declarative static-binary patch list.
+#
+# Each [[patch]] entry modifies bytes in the Factorio binary at a given
+# symbol-relative offset. Patches are verified against `expect_bytes` before
+# any write, and a `.orig` backup is kept so the patch can be reverted.
+#
+# Conventions:
+#   name         short identifier for the patch (used by logs + CLI)
+#   symbol       demangled substring matched against re/symbols/defined.txt.
+#                resolves to a file offset at apply time. If absent, use `offset`.
+#   offset_hex   file VMA (hex). An alternative to `symbol`; use when patching
+#                raw bytes that aren't tied to a function.
+#   expect_bytes whitespace-separated hex bytes that must appear at the target
+#                before the patch is applied. Catches version drift.
+#   new_bytes    the bytes to write.
+#   comment      human-readable explanation. Keep it short.
+#
+# Example (inert): NOP out the first byte of Map::updateEntities. Commented
+# out so this file as shipped is a no-op. Uncomment to test the tooling.
+#
+# [[patch]]
+# name = "demo_nop_map_update"
+# symbol = "Map::updateEntities()"
+# expect_bytes = "55"   # push rbp
+# new_bytes    = "90"   # nop
+# comment      = "harmless demo — renders updateEntities prologue not-quite-valid"
+
+# --- real patches go below this line ---

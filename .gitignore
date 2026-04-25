@@ -1,0 +1,46 @@
+# =====================================================================
+# .gitignore for factorio-re-toolkit
+# =====================================================================
+# This repo holds tools, scripts, and source code only.
+# Game install, RE artifacts, and build outputs live OUTSIDE the repo
+# (in sibling dirs of factorio-re-toolkit/) and never get committed.
+# =====================================================================
+
+# ---- Ghidra install -------------------------------------------------
+# Bootstrap script downloads Ghidra into tools/ on first run; the
+# unpacked install is ~1 GB.
+/tools/ghidra
+/tools/ghidra_*_PUBLIC/
+
+# ---- mods/native build output --------------------------------------
+# All cmake-generated artifacts.
+/mods/native/build/
+
+# ---- Static patch journal ------------------------------------------
+# Per-machine state: records which patches are applied + the binary
+# sha256 they were verified against. Don't commit; it's machine-local
+# and references binary content.
+/mods/native/patches/journal.json
+
+# ---- Editor / OS noise ---------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---- Python -------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Backup / temp / scratch files ---------------------------------
+*.orig          # never commit binary backups (e.g. factorio.orig)
+*.bak
+*.tmp
+*.rej
