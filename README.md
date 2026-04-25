@@ -32,18 +32,28 @@ The toolkit assumes a workspace with this structure:
     ├── tools/
     │   ├── ghidra/                # Ghidra install (gitignored, bootstrap-installed)
     │   ├── ghidra-scripts/
-    │   │   ├── DecompileToFiles.java  # takes nm-derived defined.txt + regex,
-    │   │   │                          # resolves file VMAs to Ghidra addresses,
-    │   │   │                          # emits one .c file per matched function
-    │   │   └── decompile.sh           # wrapper; writes to <workspace>/re/decompiled/
+    │   │   ├── DecompileToFiles.java  # nm defined.txt + regex → .c per function
+    │   │   ├── decompile.sh           # wrapper; writes to <workspace>/re/decompiled/
+    │   │   ├── RenameFunctions.java   # one-time rename pass: applies demangled
+    │   │   │                          # names to every function in the project,
+    │   │   │                          # eliminating FUN_<addr> in decompile output
+    │   │   └── rename_functions.sh    # wrapper for the rename script
     │   ├── extract_dwarf_structs.py   # pyelftools DWARF struct dumper
     │   │                              # (not useful here; see "Struct layouts")
     │   ├── infer_struct_fields.py     # parses decompiled .c files, aggregates
     │   │                              # `*(T*)(this+0xN)` accesses → struct skeleton
+    │   ├── infer_structs_for_all.sh   # runs the above over every per-class dir
+    │   ├── auto_type_fields.py        # streams objdump on whole binary, applies
+    │   │                              # strict rules to type each field with a
+    │   │                              # confidence tier (high/medium/reject)
+    │   ├── auto_type_all_classes.sh   # wrapper: runs auto_type_fields on every
+    │   │                              # *.inferred.h, prints aggregate summary
+    │   ├── probe_field.sh             # interactive: deeper per-field inspection
+    │   │                              # with disassembly + decompile + gdb cmds
     │   ├── partition_decompiled.py    # splits flat decompile output into
     │   │                              # per-class subdirs by leading symbol prefix
-    │   └── infer_structs_for_all.sh   # runs infer_struct_fields.py over every
-    │                                  # <workspace>/re/decompiled/<Class>/ dir
+    │   └── annotate_decompiled.py     # prepends `source-file:line` headers to
+    │                                  # each .c via addr2line; idempotent
     └── mods/native/          # native modding harness
         ├── README.md
         ├── CMakeLists.txt    # FACTORIO_BINARY → ../../../factorio/bin/x64/factorio
@@ -92,6 +102,15 @@ All commands below assume your cwd is `factorio-re-toolkit/`.
    cd factorio-re-toolkit
    ```
    Auto-imports DWARF; ~42 min; project name `factorio_standalone`.
+
+   **One-time post-import readability pass** (3 sec, mutates the project):
+   ```bash
+   ./tools/ghidra-scripts/rename_functions.sh
+   ```
+   Reads `<workspace>/re/symbols/all.txt`, applies demangled names to every
+   function, attaches the full signature as a plate comment. Idempotent.
+   After this, decompile output uses `Map__updateEntities` (Ghidra rewrites
+   `::` to `__` in C identifiers) instead of `FUN_<addr>` at call sites.
 2. Decompile selected functions: `./tools/ghidra-scripts/decompile.sh <out-dir> <regex>`.
 
    Output dirs are conventionally under the workspace's `re/decompiled/`.
@@ -113,6 +132,33 @@ All commands below assume your cwd is `factorio-re-toolkit/`.
      '^(Entity|CraftingMachine|Inserter|MiningDrill|...)::'
    python3 ./tools/partition_decompiled.py ../re/decompiled/_batch ../re/decompiled --move
    rmdir ../re/decompiled/_batch
+   ```
+
+3. **Annotate with source file:line headers** (recommended after every
+   decompile pass):
+   ```bash
+   ./tools/annotate_decompiled.py
+   ```
+   Runs `addr2line` in batch over every `.c` file under
+   `<workspace>/re/decompiled/`, prepends a comment block with the source
+   file, line number, and any inlined-call chain Wube's DWARF preserved.
+   Idempotent — re-runnable; skips already-annotated files unless `--force`.
+
+   Sample annotated header:
+   ```c
+   // Map::registerEntityByUnitNumber(unsigned long, Entity*)
+   // Address (file VMA assuming load=0): 0x1607040
+   // ------------------------------------------------------------
+   // ANNOTATED: source     : .../src/Map/Map.cpp:2551
+   // addr2line fn  : Map::registerEntityByUnitNumber(unsigned long, Entity*)
+   // ------------------------------------------------------------
+   ```
+   With inlining info when present:
+   ```c
+   // ANNOTATED: source     : .../src/Util/Targeter.cpp:113
+   // addr2line fn  : Inserter::clearPickupTarget()
+   // Inlined into  :
+   //                 <- .../src/Entity/Inserter.cpp:659  (clearPickupTarget)
    ```
 
 ### 2. Modify engine behavior at runtime (LD_PRELOAD hooks)
@@ -224,6 +270,71 @@ Or batch-infer for every class already decompiled (writes to
 ./tools/infer_structs_for_all.sh
 ```
 
+### Auto-typing fields with confidence tiers (machine-readable fact source)
+
+`infer_struct_fields.py` is a *guess* about types — Ghidra's decompiler
+inferred them from a few accesses, and that's what got recorded.
+`auto_type_fields.py` is a *measurement*: it streams `objdump -d` on the
+whole binary, watches every memory access touching each inferred offset
+across all `<Class>::*` methods, and applies strict rules to assign a
+type with an explicit confidence tier:
+
+```bash
+./tools/auto_type_all_classes.sh        # ~60 sec; one objdump pass total
+```
+
+Output: `<workspace>/re/dwarf/structs/<Class>.auto.h`, one per class,
+with every field annotated:
+
+```c
+struct Inserter {
+    /*+0x0048  width:8B  82×mov + 3×add + 1×cmp        conf:high*/    int64_t   f_48;   // arithmetic observed → integer
+    /*+0x0098  width:1B  10×movzx + 1×cmp              conf:high*/    uint8_t   f_98;   // movzx → unsigned
+    /*+0x01b8  width:8B  14×mov + 2×cmp + 1×add        conf:high*/    int64_t   f_1b8;
+    /*+0x0030  width:mixed 8B×644/16B×2  640×mov+5×lea conf:medium*/  uint64_t  f_30;   // 100% qword by count, 2 outlier xmm copies
+    /*+0x01d0  width:mixed 8B×31/4B×3/16B×2            conf:reject*/  char[?]   f_1d0;  // contradictory widths
+    ...
+};
+```
+
+**Trust rules** (also stamped into each generated header):
+
+| `conf:` tier | What it means | What an agent should do |
+|---|---|---|
+| `high` | Operand size and (where applicable) signedness derived from machine code with no contradictions | Use the type as given. No further verification needed. |
+| `medium` | One dominant interpretation but minor disagreements (e.g. 95%+ qword), OR 8B with no arithmetic (pointer-vs-int unresolvable from static analysis alone) | Use as a working hypothesis. Verify with `gdb` before writing code that depends on type kind (e.g. dereferencing it as a pointer). |
+| `reject` | Mixed widths or contradictory accesses, or no accesses at all | Treat as raw bytes (`char[?]`). Do **not** assume any typed interpretation. |
+
+**Conservatism is the design.** When in doubt, the script downgrades — it
+never claims a type it can't prove. Real numbers across the 18 inferred
+classes (770 fields):
+
+```
+TOTALS    high=101 (13%)   medium=255 (33%)   reject=414 (54%)
+```
+
+Most fields end up `reject`. That is the correct outcome — `Map`'s methods
+touch dozens of foreign objects (`Surface*`, `Entity*` held in r12-r15),
+and the same offset on different objects pollutes the evidence. The
+script can't disambiguate, so it doesn't try.
+
+**Why the format helps AI agents specifically.** Every comment carries
+the evidence rollup (`82×mov + 3×add + 1×cmp`), the operand width
+(`width:8B`), and the confidence tier (`conf:high`). An agent reading the
+header knows the conclusion *and* its derivation in one place, without
+having to re-derive from raw decompile output every time it touches the
+class. The `f_<offset>` placeholder names stay opaque; rename them in a
+hand-curated `<Class>.h` alongside the auto file when meanings are
+understood. Both files use the same offset annotation, so renaming a
+field never loses its underlying-memory provenance.
+
+**Re-run conditions.** Run `auto_type_all_classes.sh` after:
+- a new Ghidra decompile pass (which regenerated `*.inferred.h`)
+- a Wube binary update (offsets and instruction patterns shift)
+- you add new classes to `re/dwarf/structs/`
+
+The pass is idempotent — re-running just rewrites the `.auto.h` files.
+
 Current state of `re/dwarf/structs/`: 18 inferred headers covering the
 hot path. Field counts give a rough sense of class complexity:
 
@@ -257,8 +368,49 @@ struct Map {
 
 As you understand fields, rename `f_18` → `entity_count` in a curated copy
 and use those names in hooks. The inference script is a starting point,
-not ground truth — verify with `gdb` against a running session if you're
-about to write to one.
+not ground truth — verify before committing to a name.
+
+### Verifying a single field's true type
+
+Before labeling `Class::f_<offset>` as a specific type, run:
+
+```bash
+./tools/probe_field.sh <ClassName> <offset_hex>             # static checks
+./tools/probe_field.sh <ClassName> <offset_hex> --gdb       # also print gdb cmds
+```
+
+This runs three independent verifications:
+
+1. **Instruction widths**: disassembles every `<ClassName>::*` method and
+   reports each unique mnemonic + operand size that touches the offset.
+   Tells you `qword/dword/word/byte` (size) and `movsx`/`movzx` (signed vs
+   unsigned) with certainty.
+2. **Decompiled access patterns**: greps `re/decompiled/<ClassName>/` for
+   every `*(T*)(this+offset)` expression — shows how Ghidra typed the
+   accesses based on flow.
+3. **gdb runtime probe** (with `--gdb`): emits the gdb command file you
+   paste against an attached factorio process. Reads the field at four
+   widths plus pointer/float interpretations so you can see which one
+   contains a sensible value.
+
+**Decision rules:**
+
+| Probe result | What it means |
+|---|---|
+| All accesses use one width (e.g. all `qword ptr`) | Confident — label as that size |
+| All `movzx` for the size | Unsigned of that size |
+| All `movsx` / `movsxd` | Signed of that size |
+| All `movss` or `movsd` (xmm dest) | `float` / `double` |
+| Mixed widths at the same offset | Union / packed struct / bitfield — **leave as `f_<offset>`** |
+| `mov qword ptr` writes only (no arithmetic) | Pointer — confirm with gdb if address looks like `0x7f...` |
+| `lea` only | Address-of (the offset is the start of a sub-struct or array) |
+
+Caveat: the static check matches `<offset>` across all methods of the
+class, including accesses through pointers other than `this`. If a
+`Map::foo()` method touches `Surface::+0x18` via a `Surface*`, that hit
+shows up in the Map probe. Cross-check by looking at the example lines —
+ones with `[rdi+...]` are most likely the actual `this` field; others
+may be false positives.
 
 ## Filesystem note
 
