@@ -48,6 +48,11 @@ The toolkit assumes a workspace with this structure:
     │   │                              # confidence tier (high/medium/reject)
     │   ├── auto_type_all_classes.sh   # wrapper: runs auto_type_fields on every
     │   │                              # *.inferred.h, prints aggregate summary
+    │   ├── annotate_xrefs_and_metrics.py  # adds caller/callee + size/complexity
+    │   │                                  # comment block to every decompiled .c
+    │   ├── build_vtables.py           # enumerates every C++ vtable from _ZTV*
+    │   │                              # symbols, resolves each method-ptr slot,
+    │   │                              # writes <Class>.h to re/vtables/
     │   ├── probe_field.sh             # interactive: deeper per-field inspection
     │   │                              # with disassembly + decompile + gdb cmds
     │   ├── partition_decompiled.py    # splits flat decompile output into
@@ -139,6 +144,70 @@ All commands below assume your cwd is `factorio-re-toolkit/`.
    ```bash
    ./tools/annotate_decompiled.py
    ```
+
+4. **Annotate with cross-references and function metrics** (also
+   recommended; ~60 sec one-time pass):
+   ```bash
+   ./tools/annotate_xrefs_and_metrics.py
+   ```
+   Streams `objdump -d` once, builds the call graph from direct `call`
+   instructions and direct `jmp`-as-tailcall instructions, computes per-
+   function size/basic-block/cyclomatic metrics, and prepends a comment
+   block to every `.c` file. Idempotent — re-running strips the previous
+   block and emits a fresh one. Sample header after this pass:
+   ```c
+   // Map::createSurface(...)
+   // Address (file VMA assuming load=0): 0x1feccb0
+
+   // ==== xrefs + metrics (auto-generated, deterministic) ====
+   // SIZE      : 2288 bytes (0x8f0)
+   // BBS       : 136      CYCLOMATIC: 60
+   // CALLERS   : 5
+   //   - Planet::getOrCreateSurface()
+   //   - Map::importSurfaces(Map&, ImportSurfacesParameters const&)
+   //   - SpacePlatform::createSurface(...)
+   //   - LuaGameScript::luaCreateSurface(lua_State*)
+   //   - MapEditorActionHandler::CreateSurface(...)
+   // CALLEES   : 28 direct  +  0 tailcall  +  1 external  +  2 indirect
+   //   direct:
+   //     - operator delete(void*, unsigned long)
+   //     - __cxa_allocate_exception
+   //     - ...
+   //   indirect: 2 call(s) through function pointer or vtable slot —
+   //             see re/vtables/<Class>.h to resolve.
+   // ==== end xrefs + metrics ====
+   ```
+   Every annotation is derived deterministically from instruction encodings
+   (a `call rel32` is bytes; the target is a fact). Indirect calls are
+   counted but never resolved here — see `build_vtables.py` for those.
+
+5. **Enumerate vtables** (one-time, ~5 sec):
+   ```bash
+   ./tools/build_vtables.py
+   ```
+   For every C++ class with virtual methods (every `_ZTV<class>` symbol
+   in the binary), reads the vtable's bytes directly and resolves each
+   method pointer through `nm`. Emits `<workspace>/re/vtables/<Class>.h`,
+   one per class. Layout follows the Itanium C++ ABI (slot 0 = offset_to_top,
+   slot 1 = typeinfo, slot 2+ = method pointers in declaration order).
+   Sample (`re/vtables/MiningDrill.h`):
+   ```c
+   // Vtable for `MiningDrill`
+   // VMA: 0x380c5b0    Slots: 604    Methods: 602    Unresolved: 0
+   struct MiningDrill_vtable {
+       /* slot  0   +0x00   offset_to_top */ ptrdiff_t  offset_to_top;  // = 0
+       /* slot  1   +0x08   typeinfo      */ void*      typeinfo;       // = 0x399eaf0
+       /* slot  2   +0x10   method        */ void*      slot_10;  // -> Entity::getDump[abi:cxx11]() const
+       /* slot  3   +0x18   method        */ void*      slot_18;  // -> Targetable::isAlarmValid(...) const
+       /* slot  5   +0x28   method        */ void*      slot_28;  // -> MiningDrill::~MiningDrill()
+       /* slot 11   +0x58   method        */ void*      slot_58;  // -> MiningDrill::draw(DrawQueue&) const
+       ...
+   };
+   ```
+   When a `.c` file shows `(**(code**)(*plVar1 + 0x58))(plVar1)`, look up
+   slot at byte offset 0x58 in the relevant `<Class>.h` to resolve the
+   virtual method. Wube engine is heavily virtual — Factorio's standalone
+   build has 3,932 vtables, and `MiningDrill` alone exposes 602 methods.
    Runs `addr2line` in batch over every `.c` file under
    `<workspace>/re/decompiled/`, prepends a comment block with the source
    file, line number, and any inlined-call chain Wube's DWARF preserved.
